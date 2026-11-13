@@ -21,9 +21,12 @@
 //!     ~/.cache/herdr/workspace-recency for the fzf switcher script.
 //!
 //! Focus: local via socket `workspace.focus` / `tab.focus` / `pane.focus`;
-//! remote via `herdr --machine <name> workspace|tab focus` (the local TUI has
-//! no API to switch its machine view, so remote focus only moves that server's
-//! own focus).
+//! remote via `herdr --machine <name> workspace|tab focus`.
+//!
+//! Cross-machine jump: a selection on another machine than the herdr TUI shows
+//! is handed to the TUI itself through
+//! $XDG_STATE_HOME/herdr/client/jump-request.json (see `request_jump`); a
+//! client that watches that file switches machine and focuses the target.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -302,18 +305,108 @@ fn load_local() -> Result<Machine, String> {
     Ok(parse_snapshot(snap, "Local", false))
 }
 
-/// `herdr machine list` -> names of enabled saved machines (TSV, name is col 2).
-fn list_machines() -> Vec<String> {
+/// `herdr machine list` -> (profile id, name) of enabled saved machines (TSV:
+/// id is col 1, name col 2).
+fn list_machines() -> Vec<(String, String)> {
     let Ok(out) = herdr_cmd(None, &["machine", "list"]) else {
         return vec![];
     };
+    parse_machine_list(&out)
+}
+
+fn parse_machine_list(out: &str) -> Vec<(String, String)> {
     out.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.split('\t').collect();
             let enabled = f.get(4).is_none_or(|e| *e != "disabled");
-            (f.len() >= 2 && enabled).then(|| f[1].to_string())
+            (f.len() >= 2 && enabled).then(|| (f[0].to_string(), f[1].to_string()))
         })
         .collect()
+}
+
+fn client_state_dir() -> PathBuf {
+    let state =
+        std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{}/.local/state", home()));
+    PathBuf::from(state).join("herdr/client")
+}
+
+/// What the herdr TUI should focus after switching machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JumpTarget {
+    Pane(String),
+    Workspace(String),
+}
+
+/// `endpoint` is a saved machine's profile id, or "local".
+fn jump_request_body(endpoint: &str, target: &JumpTarget, ts_ms: u128) -> Value {
+    let mut body = json!({"version": 1, "endpoint": endpoint, "ts": ts_ms as u64});
+    match target {
+        JumpTarget::Pane(id) => body["pane_id"] = json!(id),
+        JumpTarget::Workspace(id) => body["workspace_id"] = json!(id),
+    }
+    body
+}
+
+/// Ask the herdr TUI on this host to show `endpoint` and focus `target`. The
+/// TUI polls the request file, so it is replaced atomically (temp + rename);
+/// a client that does not know the file simply never reads it.
+fn request_jump(endpoint: &str, target: &JumpTarget) -> Result<(), String> {
+    let dir = client_state_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = jump_request_body(endpoint, target, ts);
+    let tmp = dir.join(format!("jump-request.json.{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{body}\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    fs::rename(&tmp, dir.join("jump-request.json")).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("jump request: {e}")
+    })?;
+    qlog(&format!("request_jump {body}"));
+    Ok(())
+}
+
+/// The machine the herdr TUI on this host is showing. Only meaningful outside
+/// herdr (e.g. a Ghostty quick terminal): inside a herdr popup the command runs
+/// on the shown machine's own server, which is "Local" by definition.
+/// Source: the client persists its machine selection to
+/// $XDG_STATE_HOME/herdr/client/endpoint-selection.json (profile id or null);
+/// ids map to names via `herdr machine list` (see `list_machines`).
+/// `HERDR_GOTO_HERE=<name>` overrides.
+fn viewed_machine(saved: &[(String, String)]) -> String {
+    let remote_names: Vec<String> = saved.iter().map(|(_, n)| n.clone()).collect();
+    if let Ok(h) = std::env::var("HERDR_GOTO_HERE") {
+        if remote_names.contains(&h) {
+            return h;
+        }
+        return "Local".into();
+    }
+    if std::env::var_os("HERDR_ENV").is_some() {
+        return "Local".into();
+    }
+    let path = client_state_dir().join("endpoint-selection.json");
+    let id = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("selected_profile")?.as_str().map(str::to_string));
+    let Some(id) = id else {
+        return "Local".into();
+    };
+    saved
+        .iter()
+        .find(|(pid, _)| *pid == id)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| "Local".into())
+}
+
+fn read_cached_remote(name: &str) -> Option<Machine> {
+    let bytes = fs::read(cache_dir().join(format!("{name}.json"))).ok()?;
+    let snap = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let mut m = parse_snapshot(&snap, name, true);
+    m.stale = true;
+    Some(m)
 }
 
 /// Fetch a remote snapshot; returns the raw snapshot JSON so it can be cached.
@@ -325,10 +418,61 @@ fn fetch_remote_snapshot(name: &str) -> Result<Value, String> {
         .ok_or_else(|| "no snapshot".to_string())
 }
 
+/// --quick debug trail: $XDG_CACHE_HOME/herdr/goto/quick.log (append).
+fn qlog(msg: &str) {
+    if std::env::var_os("HERDR_GOTO_LOG").is_none() {
+        return;
+    }
+    let _ = fs::create_dir_all(cache_dir());
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_dir().join("quick.log"))
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{t} {msg}");
+    }
+}
+
+/// Run `herdr --machine <m> <cmd>...` one after another in a detached process
+/// group, so the caller can exit at once (each call is an ssh round trip,
+/// ~0.5s) and closing the popup / quick terminal does not SIGHUP them.
+fn spawn_remote(machine: &str, cmds: &[&[&str]]) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut script = String::new();
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c");
+    let mut args: Vec<String> = vec![herdr_bin(), machine.to_string()];
+    for cmd in cmds {
+        if !script.is_empty() {
+            script.push_str(" && ");
+        }
+        script.push_str("\"$0\" --machine \"$1\"");
+        for a in *cmd {
+            args.push(a.to_string());
+            script.push_str(&format!(" \"${{{}}}\"", args.len() - 1));
+        }
+    }
+    c.arg(script).args(&args);
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    c.process_group(0);
+    qlog(&format!("spawn_remote {machine} {cmds:?}"));
+    c.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 fn focus_pane(m: &Machine, ws: &Workspace, pane: &Pane) -> Result<(), String> {
     if m.remote {
-        herdr_cmd(Some(&m.name), &["workspace", "focus", &ws.workspace_id])?;
-        herdr_cmd(Some(&m.name), &["tab", "focus", &pane.tab_id])?;
+        spawn_remote(
+            &m.name,
+            &[
+                &["workspace", "focus", &ws.workspace_id],
+                &["tab", "focus", &pane.tab_id],
+            ],
+        )?;
     } else {
         socket_call("workspace.focus", json!({"workspace_id": ws.workspace_id}))?;
         socket_call("tab.focus", json!({"tab_id": pane.tab_id}))?;
@@ -339,7 +483,7 @@ fn focus_pane(m: &Machine, ws: &Workspace, pane: &Pane) -> Result<(), String> {
 
 fn focus_workspace(m: &Machine, ws: &Workspace) -> Result<(), String> {
     if m.remote {
-        herdr_cmd(Some(&m.name), &["workspace", "focus", &ws.workspace_id])?;
+        spawn_remote(&m.name, &[&["workspace", "focus", &ws.workspace_id]])?;
     } else {
         socket_call("workspace.focus", json!({"workspace_id": ws.workspace_id}))?;
     }
@@ -459,6 +603,15 @@ fn load_recency() -> Vec<WsRef> {
             })
         })
         .collect()
+}
+
+/// The "last" workspace: most recent one other than `here` on the SAME machine
+/// as the TUI is showing, so the default never switches machine by surprise.
+fn alternate_for(recency: &[WsRef], here: &WsRef) -> Option<WsRef> {
+    recency
+        .iter()
+        .find(|r| *r != here && r.machine == here.machine)
+        .cloned()
 }
 
 /// Move `r` to the top of the recency log (dedup, capped) and persist it.
@@ -804,7 +957,7 @@ impl Filter {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Row {
     Machine {
         m: usize,
@@ -875,6 +1028,9 @@ struct App {
     alternate: Option<WsRef>, // the "last" workspace for ' / Tab
     initial_pending: bool,    // alternate not visible yet (machine still loading)
     user_moved: bool,         // cursor touched by the user; stop auto-placement
+    here_machine: String,     // machine the herdr TUI is showing (see viewed_machine)
+    here_ws: String,          // its focused workspace as last seen
+    machine_ids: HashMap<String, String>, // saved machine name -> profile id
     preview: Preview,
     repos: HashMap<String, Repo>,     // repo_key -> worktrees
     ws_repo: HashMap<String, String>, // local workspace id -> repo_key
@@ -1126,8 +1282,28 @@ impl App {
 
     /// Row of the pane currently focused in the local herdr session.
     fn focused_pane_row(&self) -> Option<usize> {
-        let local = self.machines.iter().find(|m| !m.remote)?;
-        self.position_of_key(&format!("p:{}/{}", local.name, local.focused_pane))
+        let m = self
+            .machines
+            .iter()
+            .find(|m| m.name == self.here_machine)
+            .or_else(|| self.machines.iter().find(|m| !m.remote))?;
+        self.position_of_key(&format!("p:{}/{}", m.name, m.focused_pane))
+    }
+
+    /// Fallback cursor when the last/focused workspace is hidden (status
+    /// filter, folding): the first visible entry on the machine the TUI shows,
+    /// never an arbitrary row on another machine.
+    fn here_machine_row(&self) -> Option<usize> {
+        let hm = self.machines.iter().position(|m| m.name == self.here_machine)?;
+        let mut header = None;
+        for (i, row) in self.rows.iter().enumerate() {
+            match row {
+                Row::Pane { m, .. } | Row::Workspace { m, .. } if *m == hm => return Some(i),
+                Row::Machine { m, .. } if *m == hm => header = Some(i),
+                _ => {}
+            }
+        }
+        header
     }
 
     /// First row belonging to workspace `r`: its first pane, or the header if
@@ -1163,9 +1339,37 @@ impl App {
                     .iter()
                     .any(|m| m.name == a.machine && !matches!(m.load, Load::Failed(_)))
             });
-        let i = alt.or_else(|| self.focused_pane_row());
+        let i = alt
+            .or_else(|| self.focused_pane_row())
+            .or_else(|| self.here_machine_row());
         if i.is_some() {
             self.select(i);
+        }
+    }
+
+    /// The viewed remote's live snapshot arrived: if its focus differs from
+    /// the cached one, re-stamp MRU and re-place the cursor (unless moved).
+    fn refresh_here(&mut self) {
+        let Some(ws) = self
+            .machines
+            .iter()
+            .find(|m| m.name == self.here_machine)
+            .map(|m| m.focused_workspace.clone())
+        else {
+            return;
+        };
+        if ws.is_empty() || ws == self.here_ws {
+            return;
+        }
+        self.here_ws = ws.clone();
+        let here = WsRef {
+            machine: self.here_machine.clone(),
+            ws,
+        };
+        stamp_recency(&mut self.recency, here.clone());
+        self.alternate = alternate_for(&self.recency, &here);
+        if !self.user_moved {
+            self.select_initial();
         }
     }
 
@@ -1500,6 +1704,9 @@ impl App {
                     }
                 }
                 self.rebuild();
+                if name == self.here_machine && !stale {
+                    self.refresh_here();
+                }
                 if self.initial_pending {
                     self.select_initial();
                 }
@@ -2210,9 +2417,20 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
-    let remote_names = list_machines();
+    let quick = std::env::args().skip(1).any(|a| a == "--quick");
+    let saved = list_machines();
+    let here_machine = viewed_machine(&saved);
+    let remote_names: Vec<String> = saved.iter().map(|(_, n)| n.clone()).collect();
+    let machine_ids: HashMap<String, String> =
+        saved.into_iter().map(|(id, n)| (n, id)).collect();
     let mut machines = vec![local];
-    machines.extend(remote_names.iter().map(|n| Machine::placeholder(n)));
+    machines.extend(remote_names.iter().map(|n| {
+        // the viewed remote's cache is read up front so the cursor can start there
+        (*n == here_machine)
+            .then(|| read_cached_remote(n))
+            .flatten()
+            .unwrap_or_else(|| Machine::placeholder(n))
+    }));
 
     let (tx, rx) = mpsc::channel::<Msg>();
     let (ptx, prx) = mpsc::channel::<PreviewReq>();
@@ -2229,7 +2447,7 @@ fn main() -> io::Result<()> {
         let tx = tx.clone();
         thread::spawn(move || worktree_worker(wrx, tx));
     }
-    for name in remote_names {
+    for name in remote_names.clone() {
         let tx = tx.clone();
         thread::spawn(move || remote_watcher(name, tx));
     }
@@ -2237,13 +2455,19 @@ fn main() -> io::Result<()> {
     // MRU: stamp where we are now; the entry below it is the "last" workspace
     let mut recency = load_recency();
     let here = WsRef {
-        machine: "Local".into(),
-        ws: machines[0].focused_workspace.clone(),
+        machine: here_machine.clone(),
+        ws: machines
+            .iter()
+            .find(|m| m.name == here_machine)
+            .map(|m| m.focused_workspace.clone())
+            .unwrap_or_default(),
     };
+    let here_ws = here.ws.clone();
+    qlog(&format!("start here={here_machine}/{} machines={remote_names:?}", here.ws));
     if !here.ws.is_empty() {
         stamp_recency(&mut recency, here.clone());
     }
-    let alternate = recency.iter().find(|r| **r != here).cloned();
+    let alternate = alternate_for(&recency, &here);
 
     let mut app = App {
         machines,
@@ -2266,6 +2490,9 @@ fn main() -> io::Result<()> {
         alternate,
         initial_pending: false,
         user_moved: false,
+        here_machine,
+        here_ws,
+        machine_ids,
         preview: Preview {
             on: load_preview_pref(),
             cache: HashMap::new(),
@@ -2283,9 +2510,15 @@ fn main() -> io::Result<()> {
     app.select_initial();
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app, &tx, rx, &ptx);
+    if quick {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableFocusChange);
+    }
+    let result = run(&mut terminal, &mut app, &tx, rx, &ptx, quick);
+    if quick {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableFocusChange);
+    }
     ratatui::restore();
-    result
+    result.map(|_| ())
 }
 
 fn run(
@@ -2294,7 +2527,12 @@ fn run(
     tx: &mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
     ptx: &mpsc::Sender<PreviewReq>,
-) -> io::Result<()> {
+    quick: bool,
+) -> io::Result<bool> {
+    // Ghostty reports the current focus state right after focus reporting is
+    // enabled; a window that is still appearing may say "lost" first. Only a
+    // loss after a gain means the quick terminal was really hidden.
+    let mut focused = false;
     loop {
         while let Ok(msg) = rx.try_recv() {
             app.apply(msg, tx);
@@ -2306,33 +2544,61 @@ fn run(
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            // --quick (Ghostty quick terminal): hidden == done, so a stale
+            // navigator never lingers behind the next toggle
+            Event::FocusGained => {
+                qlog("focus gained");
+                focused = true;
+                continue;
+            }
+            Event::FocusLost if quick && focused => {
+                qlog("focus lost -> exit");
+                return Ok(false);
+            }
+            _ => continue,
         };
         match handle_key(app, key) {
             Action::None => {}
-            Action::Quit => return Ok(()),
+            Action::Quit => {
+                qlog("quit");
+                return Ok(false);
+            }
             Action::Open => {
                 let Some(row) = app.selected.and_then(|i| app.rows.get(i)).cloned() else {
                     continue;
                 };
-                let result = match &row {
+                // (workspace reached, what the TUI should focus there). A
+                // selection on the machine the TUI shows is focused through
+                // that machine's API; one on another machine is left to the
+                // TUI, which switches machine and focuses in one step.
+                let result: Result<Option<(WsRef, JumpTarget)>, String> = match &row {
                     Row::Pane { m, w, p, .. } => {
                         let (m, w) = (&app.machines[*m], &app.machines[*m].workspaces[*w]);
-                        focus_pane(m, w, &w.panes[*p]).map(|_| {
-                            Some(WsRef {
-                                machine: m.name.clone(),
-                                ws: w.workspace_id.clone(),
-                            })
+                        let pane = &w.panes[*p];
+                        let here = m.name == app.here_machine;
+                        (if here { focus_pane(m, w, pane) } else { Ok(()) }).map(|_| {
+                            Some((
+                                WsRef {
+                                    machine: m.name.clone(),
+                                    ws: w.workspace_id.clone(),
+                                },
+                                JumpTarget::Pane(pane.pane_id.clone()),
+                            ))
                         })
                     }
                     Row::Workspace { m, w, .. } => {
                         let (m, w) = (&app.machines[*m], &app.machines[*m].workspaces[*w]);
-                        focus_workspace(m, w).map(|_| {
-                            Some(WsRef {
-                                machine: m.name.clone(),
-                                ws: w.workspace_id.clone(),
-                            })
+                        let here = m.name == app.here_machine;
+                        (if here { focus_workspace(m, w) } else { Ok(()) }).map(|_| {
+                            Some((
+                                WsRef {
+                                    machine: m.name.clone(),
+                                    ws: w.workspace_id.clone(),
+                                },
+                                JumpTarget::Workspace(w.workspace_id.clone()),
+                            ))
                         })
                     }
                     Row::Machine { m, .. } => {
@@ -2343,18 +2609,69 @@ fn run(
                     Row::Worktree { m, repo, i, .. } => {
                         let path = app.worktree(repo, *i).path.clone();
                         let machine = app.machines[*m].name.clone();
-                        open_worktree(&path).map(|ws| ws.map(|ws| WsRef { machine, ws }))
+                        open_worktree(&path).map(|ws| {
+                            ws.map(|ws| {
+                                let target = JumpTarget::Workspace(ws.clone());
+                                (WsRef { machine, ws }, target)
+                            })
+                        })
                     }
                 };
+                qlog(&format!("open {row:?} -> {result:?}"));
+                let result = result.and_then(|opened| {
+                    let Some((r, target)) = opened else {
+                        return Ok(None);
+                    };
+                    if r.machine != app.here_machine {
+                        let endpoint = if app.machines.iter().any(|m| m.name == r.machine && !m.remote) {
+                            "local"
+                        } else {
+                            app.machine_ids
+                                .get(&r.machine)
+                                .map(String::as_str)
+                                .ok_or_else(|| format!("no saved machine named {}", r.machine))?
+                        };
+                        request_jump(endpoint, &target)?;
+                    }
+                    Ok(Some(r))
+                });
                 match result {
                     Ok(Some(r)) => {
                         stamp_recency(&mut app.recency, r);
-                        return Ok(());
+                        return Ok(true);
                     }
                     Ok(None) => {}
                     Err(e) => app.message = Some(format!("focus failed: {e}")),
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_list_keeps_ids_and_skips_disabled() {
+        let out = "aa\tgx10\tgx10\tdefault\tenabled\nbb\tleon\tleon\tdefault\tdisabled\n\n";
+        assert_eq!(
+            parse_machine_list(out),
+            vec![("aa".to_string(), "gx10".to_string())]
+        );
+    }
+
+    #[test]
+    fn jump_request_names_exactly_one_target() {
+        let pane = jump_request_body("local", &JumpTarget::Pane("w30:p1".into()), 1794291489675);
+        assert_eq!(
+            pane,
+            json!({"version": 1, "endpoint": "local", "pane_id": "w30:p1", "ts": 1794291489675u64})
+        );
+        let ws = jump_request_body("aa", &JumpTarget::Workspace("w4".into()), 7);
+        assert_eq!(
+            ws,
+            json!({"version": 1, "endpoint": "aa", "workspace_id": "w4", "ts": 7})
+        );
     }
 }
