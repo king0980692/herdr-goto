@@ -93,8 +93,25 @@ height = "80%"
 Everything goes through herdr's socket API (`$HERDR_SOCKET_PATH`):
 `session.snapshot`, `events.subscribe`, `pane.focus`, `pane.read`,
 `worktree.list`, `worktree.open`. Remote machines are reached with
-`herdr --machine <name> …`. State lives in `~/.cache/herdr/goto/`
+`herdr --machine <name> …`. State lives in `~/.cache/<app>/goto/`
 (remote snapshot cache, MRU log, filter and preview preferences).
+
+Jumping to a pane on another machine writes `client/jump-request.json` in
+the app's state dir (`$HERDR_STATE_DIR`, else `~/.local/state/<app>`); the
+herdr client switches machine and focuses it.
+
+### herdr-native and other Herdr apps
+
+Inside a Herdr pane or popup, goto follows that app: its socket
+(`$HERDR_SOCKET_PATH`), binary (`$HERDR_BIN_PATH`) and state dir. Outside
+Herdr (e.g. a quick terminal) there is no such env, so set the app:
+
+```sh
+HERDR_GOTO_APP=herdr-native herdr-goto
+```
+
+This uses `~/.config/herdr-native/herdr.sock`, `~/.local/state/herdr-native`, `~/.cache/herdr-native`
+and the `herdr-native` binary (XDG dirs respected).
 
 ## License
 

@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -239,17 +239,37 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_default()
 }
 
+/// Which Herdr app goto talks to ("herdr", "herdr-native", ...): its dir name
+/// under the XDG config/state dirs and its default binary. Inside a Herdr pane
+/// or popup it is the basename of `$HERDR_BIN_PATH`; outside (no env, e.g. a
+/// quick terminal) `HERDR_GOTO_APP`; else "herdr".
+fn app_name() -> String {
+    resolve_app_name(
+        std::env::var("HERDR_BIN_PATH").ok().as_deref(),
+        std::env::var("HERDR_GOTO_APP").ok().as_deref(),
+    )
+}
+
+fn resolve_app_name(bin_path: Option<&str>, goto_app: Option<&str>) -> String {
+    let from_bin = bin_path
+        .and_then(|p| Path::new(p).file_name()?.to_str().map(str::to_string))
+        .filter(|n| n.starts_with("herdr"));
+    from_bin
+        .or_else(|| goto_app.filter(|a| !a.is_empty()).map(str::to_string))
+        .unwrap_or_else(|| "herdr".into())
+}
+
 fn socket_path() -> String {
     std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
         let base =
             std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", home()));
-        format!("{base}/herdr/herdr.sock")
+        format!("{base}/{}/herdr.sock", app_name())
     })
 }
 
 fn cache_root() -> PathBuf {
     let base = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| format!("{}/.cache", home()));
-    PathBuf::from(base).join("herdr")
+    PathBuf::from(base).join(app_name())
 }
 
 fn cache_dir() -> PathBuf {
@@ -283,7 +303,7 @@ fn socket_call(method: &str, params: Value) -> Result<Value, String> {
 }
 
 fn herdr_bin() -> String {
-    std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into())
+    std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| app_name())
 }
 
 fn herdr_cmd(machine: Option<&str>, args: &[&str]) -> Result<String, String> {
@@ -324,10 +344,20 @@ fn parse_machine_list(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn client_state_dir() -> PathBuf {
+/// The app's state dir: `$HERDR_STATE_DIR` (set by herdr-native in its local
+/// panes and popups), else $XDG_STATE_HOME/<app>.
+fn app_state_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("HERDR_STATE_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
     let state =
         std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{}/.local/state", home()));
-    PathBuf::from(state).join("herdr/client")
+    PathBuf::from(state).join(app_name())
+}
+
+/// Where the client watches jump-request.json and keeps endpoint-selection.json.
+fn client_state_dir() -> PathBuf {
+    app_state_dir().join("client")
 }
 
 /// What the herdr TUI should focus after switching machine.
@@ -368,11 +398,13 @@ fn request_jump(endpoint: &str, target: &JumpTarget) -> Result<(), String> {
     Ok(())
 }
 
-/// The machine the herdr TUI on this host is showing. Only meaningful outside
-/// herdr (e.g. a Ghostty quick terminal): inside a herdr popup the command runs
-/// on the shown machine's own server, which is "Local" by definition.
+/// The machine the herdr TUI on this host is showing. Outside herdr (e.g. a
+/// Ghostty quick terminal) and in herdr-native popups (which run on this host
+/// and get `$HERDR_STATE_DIR`) it comes from the client. Inside a plain herdr
+/// popup the command runs on the shown machine's own server, which is "Local"
+/// by definition.
 /// Source: the client persists its machine selection to
-/// $XDG_STATE_HOME/herdr/client/endpoint-selection.json (profile id or null);
+/// <state dir>/client/endpoint-selection.json (profile id or null);
 /// ids map to names via `herdr machine list` (see `list_machines`).
 /// `HERDR_GOTO_HERE=<name>` overrides.
 fn viewed_machine(saved: &[(String, String)]) -> String {
@@ -383,7 +415,7 @@ fn viewed_machine(saved: &[(String, String)]) -> String {
         }
         return "Local".into();
     }
-    if std::env::var_os("HERDR_ENV").is_some() {
+    if std::env::var_os("HERDR_ENV").is_some() && std::env::var_os("HERDR_STATE_DIR").is_none() {
         return "Local".into();
     }
     let path = client_state_dir().join("endpoint-selection.json");
@@ -458,7 +490,9 @@ fn spawn_remote(machine: &str, cmds: &[&[&str]]) -> Result<(), String> {
         }
     }
     c.arg(script).args(&args);
-    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    c.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     c.process_group(0);
     qlog(&format!("spawn_remote {machine} {cmds:?}"));
     c.spawn().map(|_| ()).map_err(|e| e.to_string())
@@ -1025,11 +1059,11 @@ struct App {
     table: TableState,
     message: Option<String>,
     recency: Vec<WsRef>,
-    alternate: Option<WsRef>, // the "last" workspace for ' / Tab
-    initial_pending: bool,    // alternate not visible yet (machine still loading)
-    user_moved: bool,         // cursor touched by the user; stop auto-placement
-    here_machine: String,     // machine the herdr TUI is showing (see viewed_machine)
-    here_ws: String,          // its focused workspace as last seen
+    alternate: Option<WsRef>,             // the "last" workspace for ' / Tab
+    initial_pending: bool,                // alternate not visible yet (machine still loading)
+    user_moved: bool,                     // cursor touched by the user; stop auto-placement
+    here_machine: String,                 // machine the herdr TUI is showing (see viewed_machine)
+    here_ws: String,                      // its focused workspace as last seen
     machine_ids: HashMap<String, String>, // saved machine name -> profile id
     preview: Preview,
     repos: HashMap<String, Repo>,     // repo_key -> worktrees
@@ -1294,7 +1328,10 @@ impl App {
     /// filter, folding): the first visible entry on the machine the TUI shows,
     /// never an arbitrary row on another machine.
     fn here_machine_row(&self) -> Option<usize> {
-        let hm = self.machines.iter().position(|m| m.name == self.here_machine)?;
+        let hm = self
+            .machines
+            .iter()
+            .position(|m| m.name == self.here_machine)?;
         let mut header = None;
         for (i, row) in self.rows.iter().enumerate() {
             match row {
@@ -2421,8 +2458,7 @@ fn main() -> io::Result<()> {
     let saved = list_machines();
     let here_machine = viewed_machine(&saved);
     let remote_names: Vec<String> = saved.iter().map(|(_, n)| n.clone()).collect();
-    let machine_ids: HashMap<String, String> =
-        saved.into_iter().map(|(id, n)| (n, id)).collect();
+    let machine_ids: HashMap<String, String> = saved.into_iter().map(|(id, n)| (n, id)).collect();
     let mut machines = vec![local];
     machines.extend(remote_names.iter().map(|n| {
         // the viewed remote's cache is read up front so the cursor can start there
@@ -2463,7 +2499,10 @@ fn main() -> io::Result<()> {
             .unwrap_or_default(),
     };
     let here_ws = here.ws.clone();
-    qlog(&format!("start here={here_machine}/{} machines={remote_names:?}", here.ws));
+    qlog(&format!(
+        "start here={here_machine}/{} machines={remote_names:?}",
+        here.ws
+    ));
     if !here.ws.is_empty() {
         stamp_recency(&mut recency, here.clone());
     }
@@ -2623,7 +2662,11 @@ fn run(
                         return Ok(None);
                     };
                     if r.machine != app.here_machine {
-                        let endpoint = if app.machines.iter().any(|m| m.name == r.machine && !m.remote) {
+                        let endpoint = if app
+                            .machines
+                            .iter()
+                            .any(|m| m.name == r.machine && !m.remote)
+                        {
                             "local"
                         } else {
                             app.machine_ids
@@ -2651,6 +2694,33 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_name_prefers_bin_path_then_goto_app() {
+        assert_eq!(
+            resolve_app_name(Some("/opt/bin/herdr-native"), Some("herdr")),
+            "herdr-native"
+        );
+        assert_eq!(
+            resolve_app_name(Some("/usr/local/bin/herdr"), Some("herdr-native")),
+            "herdr"
+        );
+        assert_eq!(resolve_app_name(None, Some("herdr-native")), "herdr-native");
+        assert_eq!(resolve_app_name(Some("/tmp/weird"), None), "herdr");
+        assert_eq!(resolve_app_name(None, Some("")), "herdr");
+    }
+
+    #[test]
+    fn machine_list_keeps_hc_ids() {
+        let out = "aa\tleon\tleon\tdefault\tenabled\nhc:r1/m9\tgx10\tgx10\thcs-1\tconnected\n";
+        assert_eq!(
+            parse_machine_list(out),
+            vec![
+                ("aa".to_string(), "leon".to_string()),
+                ("hc:r1/m9".to_string(), "gx10".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn machine_list_keeps_ids_and_skips_disabled() {
