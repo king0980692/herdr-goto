@@ -1,6 +1,6 @@
 [package]
 name = "herdr-goto"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Tree navigator popup for herdr: machine > workspace > pane with live status, fuzzy search, vim keys, MRU jump, preview and worktrees"
 license = "MIT"
