@@ -151,6 +151,9 @@ fn parse_snapshot(snap: &Value, name: &str, remote: bool) -> Machine {
         .into_iter()
         .flatten()
     {
+        if is_ignored_pane(p) {
+            continue;
+        }
         let agent = p.get("agent").and_then(Value::as_str).map(str::to_string);
         let raw_status = s(p, "agent_status");
         let status = if agent.is_some() {
@@ -415,14 +418,20 @@ fn viewed_machine(saved: &[(String, String)]) -> String {
         }
         return "Local".into();
     }
-    if std::env::var_os("HERDR_ENV").is_some() && std::env::var_os("HERDR_STATE_DIR").is_none() {
+    // Plain herdr runs a popup on the shown machine's own server. herdr-native
+    // runs it on this host whatever machine is shown (with or without
+    // HERDR_STATE_DIR, which older builds don't export).
+    if std::env::var_os("HERDR_ENV").is_some()
+        && std::env::var_os("HERDR_STATE_DIR").is_none()
+        && app_name() == "herdr"
+    {
         return "Local".into();
     }
     let path = client_state_dir().join("endpoint-selection.json");
     let id = fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.get("selected_profile")?.as_str().map(str::to_string));
+        .and_then(|v| selected_endpoint_id(&v));
     let Some(id) = id else {
         return "Local".into();
     };
@@ -431,6 +440,30 @@ fn viewed_machine(saved: &[(String, String)]) -> String {
         .find(|(pid, _)| *pid == id)
         .map(|(_, n)| n.clone())
         .unwrap_or_else(|| "Local".into())
+}
+
+/// The `machine list` id of the machine an endpoint-selection.json names, or
+/// None for Local. herdr-native keeps an hc machine as `selected_shared`
+/// ({registry_core_id, core_id}, listed as `hc:<registry>/<core>`) and a
+/// saved SSH machine as `selected_profile`.
+fn selected_endpoint_id(sel: &Value) -> Option<String> {
+    if let Some(sh) = sel.get("selected_shared").filter(|v| !v.is_null()) {
+        let reg = sh.get("registry_core_id")?.as_str()?;
+        let core = sh.get("core_id")?.as_str()?;
+        return Some(format!("hc:{reg}/{core}"));
+    }
+    sel.get("selected_profile")?.as_str().map(str::to_string)
+}
+
+/// Panes that are part of the UI rather than places to go: the herdr-sidebar
+/// plugin (reports `herdr-sidebar-*` tokens; runs from its plugin dir).
+fn is_ignored_pane(p: &Value) -> bool {
+    let sidebar_tokens = p
+        .get("tokens")
+        .and_then(Value::as_object)
+        .is_some_and(|t| t.keys().any(|k| k.starts_with("herdr-sidebar")));
+    let cwd = p.get("cwd").and_then(Value::as_str).unwrap_or("");
+    sidebar_tokens || (cwd.contains("/plugins/") && cwd.ends_with("/herdr-sidebar"))
 }
 
 fn read_cached_remote(name: &str) -> Option<Machine> {
@@ -2708,6 +2741,38 @@ mod tests {
         assert_eq!(resolve_app_name(None, Some("herdr-native")), "herdr-native");
         assert_eq!(resolve_app_name(Some("/tmp/weird"), None), "herdr");
         assert_eq!(resolve_app_name(None, Some("")), "herdr");
+    }
+
+    #[test]
+    fn selection_maps_hc_and_ssh_to_machine_list_ids() {
+        let hc = json!({"version": 1, "selected_profile": null,
+            "selected_shared": {"registry_core_id": "r1", "core_id": "m9"}});
+        assert_eq!(selected_endpoint_id(&hc).as_deref(), Some("hc:r1/m9"));
+        let ssh = json!({"version": 1, "selected_profile": "aa"});
+        assert_eq!(selected_endpoint_id(&ssh).as_deref(), Some("aa"));
+        let local = json!({"version": 1, "selected_profile": null});
+        assert_eq!(selected_endpoint_id(&local), None);
+    }
+
+    #[test]
+    fn sidebar_panes_are_ignored() {
+        let sidebar = json!({"pane_id": "w3:p9", "workspace_id": "w3", "tab_id": "w3:t1", "label": "Sidebar",
+            "cwd": "/u/.config/herdr/plugins/local/herdr-sidebar",
+            "tokens": {"herdr-sidebar-git": "1"}});
+        let shell = json!({"pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "cwd": "/u/herdr-goto", "tokens": {}});
+        assert!(is_ignored_pane(&sidebar));
+        assert!(!is_ignored_pane(&shell));
+        let snap = json!({"workspaces": [{"workspace_id": "w3", "number": 1}],
+            "tabs": [{"tab_id": "w3:t1", "number": 1}],
+            "panes": [sidebar.clone(), shell.clone()]});
+        let m = parse_snapshot(&snap, "Local", false);
+        let ids: Vec<&str> = m
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.panes)
+            .map(|p| p.pane_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["w3:p1"]);
     }
 
     #[test]
