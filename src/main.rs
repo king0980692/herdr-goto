@@ -2548,7 +2548,7 @@ fn main() -> io::Result<()> {
         matcher: SkimMatcherV2::default().ignore_case(),
         live: false,
         query: String::new(),
-        searching: false,
+        searching: true, // start in insert mode: type to filter right away
         help: false,
         pending: None,
         page_rows: 20,

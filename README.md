@@ -81,7 +81,7 @@ height = "80%"
 | `'` `` ` `` `Tab` | last-used workspace ⇄ current pane |
 | `h` / `l` | parent · fold / unfold · first child |
 | `za` `zo` `zc` `zM` `zR` | fold toggle / open / close / all / none |
-| `/` | search (insert mode); `Esc` back to normal keeping the filter |
+| `/` | search (insert mode, the default on start); `Esc` back to normal keeping the filter |
 | `a` `b` `w` `i` `d`, `x` | status filter, clear |
 | `p` | toggle preview |
 | `Enter` | focus pane / workspace, open worktree, fold machine |
